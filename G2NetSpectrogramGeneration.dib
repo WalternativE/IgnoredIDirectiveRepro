@@ -1,0 +1,220 @@
+#!fsharp
+
+#r "nuget: Ply, 0.3.1"
+#r "nuget: Deedle, 2.4.2"
+#r "nuget: FSharp.SystemTextJson, 0.17.4"
+#r "nuget: Plotly.NET, 2.0.0-preview.7"
+#r "nuget: Plotly.NET.Interactive, 2.0.0-preview.7"
+#r "nuget: Spectrogram, 1.3.0"
+#r "nuget: SixLabors.ImageSharp, 1.0.3"
+#r "nuget: FSharp.Stats, 0.4.2"
+#r "nuget: MathNet.Numerics.FSharp, 4.15.0"
+#r "nuget: MathNet.Filtering, 0.7.0"
+
+#i "nuget:https://www.myget.org/F/gregs-experimental-packages/api/v3/index.json"
+#r "nuget: Deedle.DotNet.Interactive.Extension,0.1.0-alpha7"
+
+#!fsharp
+
+open System
+open System.IO
+open System.Net.Http
+open Deedle
+open Plotly.NET
+open Spectrogram
+open SixLabors.ImageSharp
+open SixLabors.ImageSharp.Processing
+open SixLabors.ImageSharp.Formats
+open FSharp.Control.Tasks.NonAffine
+open FSharp.Stats
+
+#!fsharp
+
+module Domain =
+    open System
+    open System.Net.Http.Headers
+
+    type Interval = { Value: int; Multiplier: int }
+
+    type TimeSeriesDataItem =
+        { From: DateTime
+          Value: float
+          Flag: int }
+
+    type TimeSeriesData =
+        { Interval: Interval
+          Unit: string
+          Data: TimeSeriesDataItem list }
+
+    type TimeSeriesDataCollectionBulkResponse =
+        { Name: string option
+          Status: int
+          Message: string option
+          Details: string option
+          Data: TimeSeriesData }
+
+    type UsernamePasswordCredentials =
+        { Username: string
+          Password: string }
+        member this.ToAuthenticationHeader() =
+            let toEncode = $"{this.Username}:{this.Password}"
+
+            let encodedString =
+                Convert.ToBase64String(System.Text.UTF8Encoding.UTF8.GetBytes(toEncode))
+
+            AuthenticationHeaderValue("Basic", encodedString)
+
+[<RequireQualifiedAccess>]
+module DataProvider =
+    open System.Net.Http
+    open System.Net.Http.Json
+    open System.Text.Json
+    open System.Text.Json.Serialization
+    open FSharp.Control.Tasks.NonAffine
+    open Domain
+
+    [<Literal>]
+    let internal fixedUrl =
+        "<omitted>/MAIN/api/repositories/ZAMS/timeseriescollections/data?from=2019-03-06T00:00:00Z&to=2020-12-23T00:00:00Z&name=PVPFM_I15&name=PVPFM_I3&name=PVPFM_Power"
+
+    let internal serializerOptions = JsonSerializerOptions()
+    serializerOptions.Converters.Add(JsonFSharpConverter())
+
+    let readDataBulk (client: HttpClient) (url: string) (credentials: UsernamePasswordCredentials) = task {
+        let requestMessage =
+            new HttpRequestMessage(HttpMethod.Get, url)
+
+        requestMessage.Headers.Authorization <- credentials.ToAuthenticationHeader()
+
+        let! response = client.SendAsync(requestMessage)
+
+        let! responseData =
+            response.Content.ReadFromJsonAsync<TimeSeriesDataCollectionBulkResponse list>(serializerOptions)
+
+        return responseData
+    }
+
+    let getCredsFromEnv () =
+        let validateEnvVar (enVar: string) =
+            if String.IsNullOrWhiteSpace enVar then
+                failwith "The environment variable appears to not be set"
+            else
+                enVar
+
+        // load creds from system environment
+        let pw =
+            System.Environment.GetEnvironmentVariable("tsm_client_pw")
+            |> validateEnvVar
+
+        let un =
+            System.Environment.GetEnvironmentVariable("tsm_client_user")
+            |> validateEnvVar
+
+        { Username = un; Password = pw }
+
+
+    let loadData (httpClient: HttpClient) = task {
+        let creds = getCredsFromEnv()
+        let! data = readDataBulk httpClient fixedUrl creds
+
+        return data
+    }
+
+#!fsharp
+
+open Domain
+
+let toImageSharpImage (bmp: System.Drawing.Bitmap) =
+    use memoryStream = new MemoryStream()
+    bmp.Save(memoryStream, System.Drawing.Imaging.ImageFormat.Png)
+    memoryStream.Seek(0L, SeekOrigin.Begin) |> ignore
+
+    let img = Image.Load memoryStream
+    memoryStream.Seek(0L, SeekOrigin.Begin) |> ignore
+
+    let format = Image.DetectFormat memoryStream
+    memoryStream.Seek(0L, SeekOrigin.Begin) |> ignore
+
+    let info = Image.Identify memoryStream
+
+    img, format, info
+
+let toBase64Encoding (bmp: System.Drawing.Bitmap) =
+    let img, format, info = toImageSharpImage bmp
+    img.ToBase64String(format)
+
+let displayImage (bmp: System.Drawing.Bitmap) =
+    let b64s = toBase64Encoding bmp
+    DisplayFunctions.HTML $"<img src=\"{b64s}\"></img>"
+
+#!fsharp
+
+let client = new HttpClient()
+
+let getG2NetTs (httpClient: HttpClient) = task {
+    let _base = "<omitted>"
+    let bulkData = "repositories/ZAMS/timeseriescollections/data?from=1970-01-01T00:00:00Z&to=1970-01-01T00:00:04.096Z"
+    let names = "&name=0000c3b9c9_0&name=0000c3b9c9_1&name=0000c3b9c9_2"
+
+    let creds = DataProvider.getCredsFromEnv()
+    let! data = DataProvider.readDataBulk httpClient $"{_base}{bulkData}{names}" creds
+
+    return data
+}
+
+let g2netSample =
+    getG2NetTs client
+    |> Async.AwaitTask
+    |> Async.RunSynchronously
+
+#!fsharp
+
+let sampleDf =
+    g2netSample
+    |> Seq.mapi (fun i bulk ->
+        bulk.Data.Data
+        |> Frame.ofRecords
+        |> Frame.sliceCols [ "Value" ]
+        |> Frame.mapColKeys (fun k -> $"{k}_{i}"))
+    |> Frame.mergeAll
+
+sampleDf
+
+#!fsharp
+
+let inline minMaxScaleObs (obs: seq<'a * ^b>) =
+    let idx, vs = Seq.unzip obs
+    let mi = Seq.min vs
+    let ma = Seq.max vs
+
+    vs
+    |> Seq.map (fun x -> (x - mi) / (ma - mi))
+    |> Seq.zip idx
+
+#!fsharp
+
+[ "Value_0"; "Value_1"; "Value_2" ]
+|> List.map (fun ck ->
+    sampleDf.GetColumn<float> ck
+    |> Series.observations
+    |> minMaxScaleObs
+    |> fun os -> Chart.Line(os, UseWebGL = true) )
+|> Chart.combine
+
+#!fsharp
+
+let toHeatmap (sampleRate: float) (ffts: ResizeArray<float array>) =
+    let rows =
+        ffts.[0]
+        |> Seq.length
+
+    let cols =
+        ffts.Count
+
+    let freqs = FftSharp.Transform.FFTfreq(sampleRate, ffts.Count)
+
+    ffts
+    |> matrix
+    |> Matrix.transpose
+    |> Matrix.toJaggedArray
+    |> fun x -> Chart.Heatmap(x, ColNames = [1..rows], RowNames = freqs, UseWebGL = true)
